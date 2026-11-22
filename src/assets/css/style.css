@@ -15,6 +15,8 @@
  *    5.1. Buttons
  *    5.2. Cards
  *    5.3. Section Titles
+ *    5.4. Modal
+ *    5.5. Toast
  * 6. PAGE: MAIN APP (index.html)
  *    6.1. App Layout
  *    6.2. Workspace & Canvas
@@ -364,6 +366,163 @@ footer nav a:hover {
 }
 
 
+/* 5.4. Modal */
+.modal {
+    width: calc(100% - 32px);
+    max-width: 420px;
+    padding: 0;
+    border: none;
+    border-radius: 16px;
+    background-color: var(--color-bg-container);
+    color: var(--color-text);
+    box-shadow: 0 12px 40px rgba(0, 0, 0, 0.15);
+}
+
+.modal[open] {
+    animation: modal-in 0.2s ease-out;
+}
+
+.modal::backdrop {
+    background-color: rgba(0, 0, 0, 0.4);
+}
+
+.modal-content {
+    padding: 1.5rem 1.5rem 1.25rem;
+}
+
+.modal-title {
+    margin: 0 0 0.5rem;
+    font-size: 1.1rem;
+    font-weight: 500;
+}
+
+.modal-message {
+    margin: 0;
+    line-height: 1.7;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+}
+
+.modal-actions {
+    display: flex;
+    justify-content: flex-end;
+    margin-top: 1.25rem;
+}
+
+.modal-actions .button {
+    min-width: 6rem;
+}
+
+@keyframes modal-in {
+    from {
+        opacity: 0;
+        transform: translateY(8px);
+    }
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .modal[open] {
+        animation: none;
+    }
+}
+
+/* 5.5. Toast */
+.toast-container {
+    position: fixed;
+    left: 50%;
+    bottom: calc(24px + env(safe-area-inset-bottom, 0px));
+    transform: translateX(-50%);
+    z-index: 2000;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0.5rem;
+    width: calc(100% - 32px);
+    max-width: 520px;
+    pointer-events: none;
+}
+
+.toast {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.75rem;
+    box-sizing: border-box;
+    max-width: 100%;
+    padding: 0.75rem 0.75rem 0.75rem 1.1rem;
+    border-radius: 12px;
+    background-color: var(--color-bg-dark);
+    color: #fff;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.2);
+    pointer-events: auto;
+    animation: toast-in 0.2s ease-out;
+}
+
+.toast.is-leaving {
+    animation: toast-out 0.2s ease-in forwards;
+}
+
+.toast-message {
+    margin: 0;
+    font-size: 0.9rem;
+    line-height: 1.6;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+}
+
+.toast-close {
+    flex-shrink: 0;
+    width: 1.6rem;
+    height: 1.6rem;
+    padding: 0;
+    border: none;
+    border-radius: 50%;
+    background: transparent;
+    color: rgba(255, 255, 255, 0.7);
+    font-size: 1.1rem;
+    line-height: 1;
+    cursor: pointer;
+}
+
+.toast-close:hover,
+.toast-close:focus-visible {
+    background-color: rgba(255, 255, 255, 0.15);
+    color: #fff;
+}
+
+@keyframes toast-in {
+    from {
+        opacity: 0;
+        transform: translateY(12px);
+    }
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
+}
+
+@keyframes toast-out {
+    from {
+        opacity: 1;
+        transform: translateY(0);
+    }
+    to {
+        opacity: 0;
+        transform: translateY(12px);
+    }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .toast,
+    .toast.is-leaving {
+        animation: none;
+    }
+}
+
+
 /* --- 6. PAGE: MAIN APP (index.html) --- */
 
 /* 6.1. App Layout */
@@ -437,6 +596,8 @@ footer nav a:hover {
     max-width: 100%;
     max-height: 100%;
     line-height: 0;
+    user-select: none;
+    -webkit-user-select: none;
 }
 
 canvas {
@@ -451,10 +612,11 @@ canvas {
     border: 2px solid var(--color-primary-400);
     box-shadow: 0 0 0 1px #fff, inset 0 0 0 1px #fff;
     cursor: move;
-    top: 25%;
-    left: 25%;
-    width: 50%;
-    height: 50%;
+    touch-action: none;
+    top: 15%;
+    left: 15%;
+    width: 70%;
+    height: 70%;
     box-sizing: border-box;
     z-index: 10;
 }

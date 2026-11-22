@@ -30,7 +30,7 @@ document.addEventListener('DOMContentLoaded', () => {
     el.style.background = `linear-gradient(90deg, ${activeColor} ${fillPercentage}%, ${inactiveColor} ${fillPercentage}%)`;
   }
 
-  // すべての range を一括取得し、イベント登録＋初期描画
+  // すべてのrangeを一括取得し、イベント登録＋初期描画
   const ranges = document.querySelectorAll('input[type="range"]');
   ranges.forEach(rangeEl => {
     rangeEl.addEventListener('input', () => updateBackground(rangeEl));

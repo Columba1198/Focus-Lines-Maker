@@ -1,3 +1,6 @@
+import { showMessage } from './modal.js';
+import { showToast } from './toast.js';
+
 document.addEventListener('DOMContentLoaded', () => {
     console.log('%cv( ･ω･ )ｨｪｨ', 'font-size: 1rem;');
     
@@ -26,7 +29,9 @@ document.addEventListener('DOMContentLoaded', () => {
     const imageLoader = document.getElementById('image-loader');
     const canvas = document.getElementById('canvas');
     const offscreen = canvas.transferControlToOffscreen();
-    worker.postMessage({ type: 'init', canvas: offscreen }, [offscreen]);
+    // 開発用：?simulateCanvasLimit=16777216 を付けると、それを超えるキャンバスを確保失敗として扱う（古いiOSの再現）
+    const simulatedCanvasLimit = Number(new URLSearchParams(location.search).get('simulateCanvasLimit')) || null;
+    worker.postMessage({ type: 'init', canvas: offscreen, simulatedCanvasLimit }, [offscreen]);
     const uploadPrompt = document.getElementById('upload-prompt');
     const canvasContainer = document.getElementById('canvas-container');
     const workspace = document.querySelector('.workspace');
@@ -54,15 +59,21 @@ document.addEventListener('DOMContentLoaded', () => {
         lineThickness: '50',
         randomness: '0.5'
     };
+    // style.cssの#focus-areaと値を揃えること
+    const defaultFocusRect = { left: 0.15, top: 0.15, width: 0.7, height: 0.7 };
     let originalFileName = '';
     let originalFileType = 'image/png';
-    let originalImage = null;
+    // 画像本体はワーカーが持つ
+    let imageSize = null;
+    // 保存時もこのシードで描き直し、プレビューと同じ配置にする
+    let currentSeed = 0;
     let focusState = {
         isDragging: false, isResizing: false,
         dragStartX: 0, dragStartY: 0,
         resizeDirection: null,
         parentWidth: 0, parentHeight: 0,
-        areaWidth: 0, areaHeight: 0
+        areaWidth: 0, areaHeight: 0,
+        activePointerId: null
     };
     let moveRafId = null;
 
@@ -72,10 +83,7 @@ document.addEventListener('DOMContentLoaded', () => {
     worker.addEventListener('message', (e) => {
         if (e.data.type === 'drawDone') {
             workerBusy = false;
-            if (drawPending) {
-                drawPending = false;
-                postDrawMessage();
-            }
+            flushPendingDraw();
         }
     });
 
@@ -91,18 +99,21 @@ document.addEventListener('DOMContentLoaded', () => {
     resetBtn.addEventListener('click', resetSettings);
     changeImageBtn.addEventListener('click', () => imageLoader.click());
 
-    [focusShapeSelect, lineTypeSelect, lineCountInput, lineThicknessInput, randomnessInput].forEach(el => {
-        el.addEventListener('input', () => postDrawMessage());
+    // 配置を保つ設定
+    [focusShapeSelect, lineTypeSelect, lineColorInput, lineThicknessInput, randomnessInput].forEach(el => {
+        el.addEventListener('input', () => postDrawMessage({ reseed: false }));
     });
+    // 本数を変えると全線の角度が変わるので、配置を作り直す
+    lineCountInput.addEventListener('input', () => postDrawMessage());
 
-    lineColorInput.addEventListener('input', () => postDrawMessage());
-
-    focusArea.addEventListener('mousedown', handleInteractionStart);
-    document.addEventListener('mousemove', handleInteractionMove);
-    document.addEventListener('mouseup', handleInteractionEnd);
-    focusArea.addEventListener('touchstart', handleInteractionStart, { passive: false });
-    document.addEventListener('touchmove', handleInteractionMove, { passive: false });
-    document.addEventListener('touchend', handleInteractionEnd);
+    focusArea.addEventListener('pointerdown', handleInteractionStart);
+    document.addEventListener('pointermove', handleInteractionMove);
+    document.addEventListener('pointerup', handleInteractionEnd);
+    // pointerupが届かない場合でも必ずドラッグを解除する
+    document.addEventListener('pointercancel', handleInteractionEnd);
+    focusArea.addEventListener('lostpointercapture', handleInteractionEnd);
+    window.addEventListener('blur', () => handleInteractionEnd());
+    canvasContainer.addEventListener('dragstart', (e) => e.preventDefault());
 
     workspace.addEventListener('dragenter', handleDragEnter, false);
     workspace.addEventListener('dragover', handleDragOver, false);
@@ -117,9 +128,11 @@ document.addEventListener('DOMContentLoaded', () => {
             const currentWindowWidth = window.innerWidth;
             if (currentWindowWidth !== lastWindowWidth) {
                 lastWindowWidth = currentWindowWidth;
-                if (originalImage) {
+                if (imageSize) {
+                    const focusRatios = getFocusAreaRatios();
                     setupCanvas();
-                    postDrawMessage();
+                    setFocusAreaRatios(focusRatios);
+                    postDrawMessage({ reseed: false });
                 }
             }
         }, 250);
@@ -160,11 +173,23 @@ document.addEventListener('DOMContentLoaded', () => {
         if (files.length > 0) {
             loadImageFile(files[0]);
         }
+        // Chrome・Safariは同じファイルを選び直すとchangeを発火しないため、選択を空にしておく
+        e.target.value = '';
     }
 
     async function loadImageFile(file) {
-        if (!file.type.startsWith('image/')) {
-            alert('画像ファイルを選択してください。');
+        const extension = (/\.([^.]+)$/.exec(file.name)?.[1] ?? '').toLowerCase();
+        const isSvg = file.type === 'image/svg+xml' || extension === 'svg';
+        // WindowsではHEICのMIMEタイプが空になることがあるため、拡張子でも判定する
+        const isHeic = /^image\/hei[cf]/.test(file.type) || extension === 'heic' || extension === 'heif';
+
+        // 主要なブラウザのcreateImageBitmapはSVGを読み込めない
+        if (isSvg) {
+            showMessage('SVG形式の画像には対応していません。JPEG・PNG・WebPなどの画像を選んでください。', { title: 'エラー' });
+            return;
+        }
+        if (!file.type.startsWith('image/') && !isHeic) {
+            showMessage('画像ファイルを選択してください。', { title: 'エラー' });
             return;
         }
 
@@ -173,10 +198,9 @@ document.addEventListener('DOMContentLoaded', () => {
 
         try {
             const imageBitmap = await createImageBitmap(file);
-            originalImage = imageBitmap;
-
-            const bitmapForWorker = await createImageBitmap(file);
-            worker.postMessage({ type: 'setImage', image: bitmapForWorker }, [bitmapForWorker]);
+            imageSize = { width: imageBitmap.width, height: imageBitmap.height };
+            // 所有権をワーカーに移す（古い画像はワーカー側で解放する）
+            worker.postMessage({ type: 'setImage', image: imageBitmap }, [imageBitmap]);
 
             uploadPrompt.classList.add('hidden');
             canvasContainer.classList.remove('hidden');
@@ -186,10 +210,15 @@ document.addEventListener('DOMContentLoaded', () => {
             changeImageBtn.disabled = false;
 
             setupCanvas();
+            setFocusAreaRatios(defaultFocusRect);
             postDrawMessage();
         } catch (e) {
             console.error('Image loading failed:', e);
-            alert('画像の読み込みに失敗しました。');
+            // HEICはSafari以外では読み込めない
+            const message = isHeic
+                ? 'このブラウザでは、HEIC形式の画像を読み込めません。JPEGなどに変換してからアップロードしてください。'
+                : '画像を読み込めませんでした。対応していない形式か、ファイルが壊れている可能性があります。JPEG・PNG・WebPなどの画像を選んでください。';
+            showMessage(message, { title: 'エラー' });
         }
     }
 
@@ -197,45 +226,68 @@ document.addEventListener('DOMContentLoaded', () => {
         const workspace = document.querySelector('.workspace');
         const maxW = workspace.clientWidth - 20;
         const maxH = workspace.clientHeight - 20;
-        const scale = Math.min(maxW / originalImage.width, maxH / originalImage.height, 2);
-        const canvasWidth = originalImage.width;
-        const canvasHeight = originalImage.height;
-        const displayWidth = canvasWidth * scale;
-        const displayHeight = canvasHeight * scale;
+        const scale = Math.min(maxW / imageSize.width, maxH / imageSize.height, 2);
+        const displayWidth = imageSize.width * scale;
+        const displayHeight = imageSize.height * scale;
         canvas.style.width = `${displayWidth}px`;
         canvas.style.height = `${displayHeight}px`;
-        worker.postMessage({ type: 'resize', width: canvasWidth, height: canvasHeight });
-        focusArea.style.top = '15%';
-        focusArea.style.left = '15%';
-        focusArea.style.width = '70%';
-        focusArea.style.height = '70%';
+        // プレビューは表示に必要な解像度で描く（保存時に元の解像度で描き直す）
+        const dpr = window.devicePixelRatio || 1;
+        const previewScale = Math.min(1, (displayWidth * dpr) / imageSize.width);
+        const previewWidth = Math.max(1, Math.round(imageSize.width * previewScale));
+        const previewHeight = Math.max(1, Math.round(imageSize.height * previewScale));
+        worker.postMessage({ type: 'resize', width: previewWidth, height: previewHeight });
         focusArea.classList.toggle('circle', focusShapeSelect.value === 'circle');
     }
 
-    function postDrawMessage() {
-        if (!originalImage) return;
+    function getFocusAreaRatios() {
+        const cw = canvasContainer.clientWidth;
+        const ch = canvasContainer.clientHeight;
+        if (cw === 0 || ch === 0) return { ...defaultFocusRect };
+        return {
+            left: focusArea.offsetLeft / cw,
+            top: focusArea.offsetTop / ch,
+            width: focusArea.offsetWidth / cw,
+            height: focusArea.offsetHeight / ch,
+        };
+    }
+
+    // %で指定し、キャンバスの表示サイズが変わっても位置と大きさの比率を保つ
+    function setFocusAreaRatios(ratios) {
+        focusArea.style.left = `${ratios.left * 100}%`;
+        focusArea.style.top = `${ratios.top * 100}%`;
+        focusArea.style.width = `${ratios.width * 100}%`;
+        focusArea.style.height = `${ratios.height * 100}%`;
+    }
+
+    function postDrawMessage({ reseed = true } = {}) {
+        if (!imageSize) return;
+        if (reseed) currentSeed = Math.floor(Math.random() * 4294967296);
 
         if (workerBusy) {
             drawPending = true;
             return;
         }
+        sendDrawMessage();
+    }
 
+    function flushPendingDraw() {
+        if (!drawPending) return;
+        drawPending = false;
+        sendDrawMessage();
+    }
+
+    function sendDrawMessage() {
         workerBusy = true;
 
-        const w = originalImage.width;
-        const h = originalImage.height;
-        const cw = canvasContainer.clientWidth;
-        const ch = canvasContainer.clientHeight;
-        const focusRect = {
-            x: focusArea.offsetLeft / cw * w,
-            y: focusArea.offsetTop / ch * h,
-            width: focusArea.offsetWidth / cw * w,
-            height: focusArea.offsetHeight / ch * h,
-        };
+        // 画像に対する比率で送り、どの解像度でも同じ位置に描けるようにする
+        const ratios = getFocusAreaRatios();
+        const focusRect = { x: ratios.left, y: ratios.top, width: ratios.width, height: ratios.height };
 
         worker.postMessage({
             type: 'draw',
             params: {
+                seed: currentSeed,
                 focusRect,
                 lineCount: parseInt(lineCountInput.value),
                 lineThickness: parseFloat(lineThicknessInput.value),
@@ -260,10 +312,7 @@ document.addEventListener('DOMContentLoaded', () => {
             el.dispatchEvent(new Event('input'));
         });
 
-        focusArea.style.top = '15%';
-        focusArea.style.left = '15%';
-        focusArea.style.width = '70%';
-        focusArea.style.height = '70%';
+        setFocusAreaRatios(defaultFocusRect);
         focusArea.classList.toggle('circle', defaultSettings.focusShape === 'circle');
 
         postDrawMessage();
@@ -285,7 +334,7 @@ document.addEventListener('DOMContentLoaded', () => {
             const blob = e.data.blob;
             if (!blob) {
                 console.error('WorkerからBlobの生成に失敗しました。');
-                alert('画像の保存に失敗しました。');
+                showMessage('画像の保存に失敗しました。', { title: 'エラー' });
                 downloadBtn.textContent = originalText;
                 downloadBtn.disabled = false;
                 return;
@@ -302,10 +351,15 @@ document.addEventListener('DOMContentLoaded', () => {
                 const url = URL.createObjectURL(blob);
                 link.href = url;
                 link.click();
-                URL.revokeObjectURL(url);
+                // click() の直後に解放すると、ブラウザによってはダウンロードが中断される
+                setTimeout(() => URL.revokeObjectURL(url), 40000);
+                if (e.data.downscaled) {
+                    console.info(`Saved at a reduced size: ${e.data.width}x${e.data.height}`);
+                    showToast('お使いの端末の制限により、画像サイズを小さくして保存しました。');
+                }
             } catch (e) {
                 console.error('画像のダウンロードに失敗しました。', e);
-                alert('画像の保存に失敗しました。');
+                showMessage('画像の保存に失敗しました。', { title: 'エラー' });
             } finally {
                 downloadBtn.textContent = originalText;
                 downloadBtn.disabled = false;
@@ -313,21 +367,21 @@ document.addEventListener('DOMContentLoaded', () => {
         };
 
         worker.addEventListener('message', handleDownload);
+        // 保留中の描画を先に送り、最新の設定で保存する（ワーカーはメッセージを順に処理する）
+        flushPendingDraw();
         worker.postMessage({ type: 'download', mimeType });
     }
 
     // --- フォーカスエリアの操作ロジック ---
-    function getClientCoords(e) {
-        if (e.touches && e.touches.length > 0) return { x: e.touches[0].clientX, y: e.touches[0].clientY };
-        return { x: e.clientX, y: e.clientY };
-    }
-
     function handleInteractionStart(e) {
-        if (e.type === 'touchstart' && e.cancelable) e.preventDefault();
+        if (e.button !== 0 || !e.isPrimary) return;
+        if (focusState.activePointerId !== null) return;
+        e.preventDefault();
         e.stopPropagation();
-        const coords = getClientCoords(e);
-        focusState.dragStartX = coords.x;
-        focusState.dragStartY = coords.y;
+        focusState.activePointerId = e.pointerId;
+        focusArea.setPointerCapture(e.pointerId);
+        focusState.dragStartX = e.clientX;
+        focusState.dragStartY = e.clientY;
         focusState.startLeft = focusArea.offsetLeft;
         focusState.startTop = focusArea.offsetTop;
         focusState.startWidth = focusArea.offsetWidth;
@@ -339,7 +393,6 @@ document.addEventListener('DOMContentLoaded', () => {
         if (e.target.classList.contains('resize-handle')) {
             focusState.isResizing = true;
             focusState.resizeDirection = e.target.dataset.direction;
-            focusState.aspectRatio = focusState.startWidth / focusState.startHeight;
         } else {
             focusState.isDragging = true;
         }
@@ -347,9 +400,12 @@ document.addEventListener('DOMContentLoaded', () => {
 
     function handleInteractionMove(e) {
         if (!focusState.isDragging && !focusState.isResizing) return;
-        if (e.type === 'touchmove' && e.cancelable) e.preventDefault();
-        const coords = getClientCoords(e);
-        focusState.lastMoveCoords = coords;
+        if (e.pointerId !== focusState.activePointerId) return;
+        if (e.pointerType === 'mouse' && (e.buttons & 1) === 0) {
+            handleInteractionEnd();
+            return;
+        }
+        focusState.lastMoveCoords = { x: e.clientX, y: e.clientY };
         focusState.lastMoveShiftKey = e.shiftKey;
 
         if (moveRafId) return;
@@ -435,12 +491,30 @@ document.addEventListener('DOMContentLoaded', () => {
                 newHeight = parentHeight - newTop;
             }
 
-            if (newWidth > 20) {
+            const keepAspectRatio = focusState.lastMoveShiftKey && focusState.startHeight > 0;
+            if (keepAspectRatio) {
+                // 画像の端で片方の辺だけ縮んだ場合に、もう片方も縮めて縦横比を保つ（掴んだハンドルの対辺は固定）
+                const originalAspectRatio = focusState.startWidth / focusState.startHeight;
+                const fittedWidth = Math.min(newWidth, newHeight * originalAspectRatio);
+                const fittedHeight = fittedWidth / originalAspectRatio;
+                if (focusState.resizeDirection.includes('w')) {
+                    newLeft = focusState.startLeft + focusState.startWidth - fittedWidth;
+                }
+                if (focusState.resizeDirection.includes('n')) {
+                    newTop = focusState.startTop + focusState.startHeight - fittedHeight;
+                }
+                newWidth = fittedWidth;
+                newHeight = fittedHeight;
+            }
+
+            // 縦横比の固定中は、片方の辺だけを更新しない
+            const sizeIsValid = !keepAspectRatio || (newWidth > 20 && newHeight > 20);
+            if (sizeIsValid && newWidth > 20) {
                 focusArea.style.left = `${newLeft}px`;
                 focusArea.style.width = `${newWidth}px`;
                 focusState.areaWidth = newWidth;
             }
-            if (newHeight > 20) {
+            if (sizeIsValid && newHeight > 20) {
                 focusArea.style.top = `${newTop}px`;
                 focusArea.style.height = `${newHeight}px`;
                 focusState.areaHeight = newHeight;
@@ -449,14 +523,20 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     }
 
-    function handleInteractionEnd() {
+    function handleInteractionEnd(e) {
+        if (e && e.pointerId !== undefined && e.pointerId !== focusState.activePointerId) return;
+        const pointerId = focusState.activePointerId;
+        focusState.activePointerId = null;
+        if (pointerId !== null && focusArea.hasPointerCapture(pointerId)) {
+            focusArea.releasePointerCapture(pointerId);
+        }
         if (focusState.isDragging || focusState.isResizing) {
             if (moveRafId) {
                 cancelAnimationFrame(moveRafId);
                 moveRafId = null;
                 applyInteractionMove();
             }
-            postDrawMessage();
+            postDrawMessage({ reseed: false });
         }
         focusState.isDragging = false;
         focusState.isResizing = false;
